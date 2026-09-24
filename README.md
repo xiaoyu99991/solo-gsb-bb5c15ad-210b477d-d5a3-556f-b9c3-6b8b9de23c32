@@ -19,7 +19,7 @@
 │   ├── database.py        # 引擎/会话，启动建表
 │   ├── models.py          # BoxEvent 模型，(box_code, seq) 唯一约束
 │   ├── schemas.py         # 请求/响应模型与时间归一化
-│   ├── services.py        # 幂等去重、冲突判定、最新状态查询、保序回归时钟校正、超温积分
+│   ├── services.py        # 幂等去重、冲突判定、最新状态查询、保序回归时钟校正、超温积分、轨迹压缩预览
 │   └── main.py            # FastAPI 路由
 ├── Dockerfile
 ├── docker-compose.yml
@@ -95,6 +95,7 @@ APP_PORT=9000 docker compose up -d --build
 | GET  | `/boxes/{box_code}/events`    | 单个箱子的全部事件（按序号升序）       |
 | GET  | `/boxes/{box_code}/clock-audit` | 区间事件的设备时钟回拨校正建议（保序回归，不改原始记录） |
 | GET  | `/boxes/{box_code}/heat-exposure` | 区间事件的超温积分（℃·秒，线性插值 + 保序校正时间，不改原始记录） |
+| GET  | `/boxes/{box_code}/trajectory-compression` | 单箱温度轨迹压缩预览（最少保留点 + 字典序最小，不改原始记录） |
 
 ### 上报事件
 
@@ -355,6 +356,99 @@ curl -i 'http://localhost:8000/boxes/BOX-HEAT/heat-exposure?seq_from=5&seq_to=2&
 curl -i 'http://localhost:8000/boxes/BOX-HEAT/heat-exposure?seq_from=0&seq_to=3&upper_limit=-2&max_gap_seconds=0'
 ```
 
+## 温度轨迹压缩预览（trajectory-compression）
+
+`GET /boxes/{box_code}/trajectory-compression`（默认访问端口 **8000**）对指定序号区间内的
+温度轨迹做**最少保留点压缩预览**：以**序号为横坐标**，在保留点之间按温度**线性插值**
+重建被省略的事件，寻找一个保留事件数最少的子序列——
+
+- **首末事件必须保留**；每个被省略事件的重建温度与原值之差不得超过 `max_error`。
+- 保留数相同时，选择**保留序号序列字典序最小**的方案。
+- 单条事件直接保留；区间内无事件返回空结果（计数为 0、`kept_events` 为空数组）。
+- 只在查询时即时计算，**不写回、不改动任何原始记录**；补报后重查即自动重算。
+- 区间内事件**至多 120 条**，超过返回 `422`（求解规模有界，请缩小序号区间）。
+
+算法：把“段 (i, j) 的中间事件全部可被线性插值覆盖”视为有向边 i→j，则问题等价于
+首事件到末事件的**最短路径**（边数最少即保留点最少）。先自右向左动态规划求出每个
+位置到终点的最优保留数，再从左向右贪心选取“可行且仍最优”的最小序号，即得字典序
+最小解。浮点重建误差判定带 1e-9 容差，吸收插值计算的浮点噪声。
+
+查询参数：
+
+- `seq_from` / `seq_to`：序号区间，**均为整数且含端点**，必须 `>= 0` 且 `seq_from <= seq_to`。
+- `max_error`：允许的最大重建误差（℃），**非负且有限**的数值；`0` 表示只允许省略严格共线的点。
+
+返回字段：
+
+| 字段                | 说明                                                       |
+| ------------------- | ---------------------------------------------------------- |
+| `event_count`       | 区间内事件条数                                             |
+| `kept_count`        | 保留事件条数（首末必留）                                   |
+| `omitted_count`     | 被省略事件条数                                             |
+| `actual_max_error`  | 被省略事件的实际最大重建误差（℃），无省略时为 `0.0`        |
+| `kept_events[]`     | 保留事件（按序号升序），含原始 `seq` / `event_time` / `temperature` |
+
+```bash
+# 先上报一组事件（UTC）：-5 -> -4.8125 -> -4.75 -> 2 -> -4.5，每分钟一条
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-COMP","seq":0,"temperature":-5.0,
+       "event_time":"2026-09-23T02:00:00+00:00"}'
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-COMP","seq":1,"temperature":-4.8125,
+       "event_time":"2026-09-23T02:01:00+00:00"}'
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-COMP","seq":2,"temperature":-4.75,
+       "event_time":"2026-09-23T02:02:00+00:00"}'
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-COMP","seq":3,"temperature":2.0,
+       "event_time":"2026-09-23T02:03:00+00:00"}'
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-COMP","seq":4,"temperature":-4.5,
+       "event_time":"2026-09-23T02:04:00+00:00"}'
+
+# 允许误差 0.1℃：seq=1 可由 0->2 线性插值重建（误差 0.0625），尖峰 seq=3 必须保留
+curl 'http://localhost:8000/boxes/BOX-COMP/trajectory-compression?seq_from=0&seq_to=4&max_error=0.1'
+```
+
+响应（保留 0、2、3、4，省略 1 条，实际最大误差 0.0625℃）：
+
+```json
+{
+  "box_code": "BOX-COMP",
+  "seq_from": 0,
+  "seq_to": 4,
+  "max_error": 0.1,
+  "event_count": 5,
+  "kept_count": 4,
+  "omitted_count": 1,
+  "actual_max_error": 0.0625,
+  "kept_events": [
+    {"seq": 0, "event_time": "2026-09-23T02:00:00", "temperature": -5.0},
+    {"seq": 2, "event_time": "2026-09-23T02:02:00", "temperature": -4.75},
+    {"seq": 3, "event_time": "2026-09-23T02:03:00", "temperature": 2.0},
+    {"seq": 4, "event_time": "2026-09-23T02:04:00", "temperature": -4.5}
+  ]
+}
+```
+
+```bash
+# 放宽到 10℃：只留首末两点，其余 3 条全部插值重建（实际最大误差 6.625℃）
+curl 'http://localhost:8000/boxes/BOX-COMP/trajectory-compression?seq_from=0&seq_to=4&max_error=10'
+
+# 箱号存在但区间内无事件 -> 200，空结果
+curl 'http://localhost:8000/boxes/BOX-COMP/trajectory-compression?seq_from=100&seq_to=200&max_error=0.1'
+
+# 箱号不存在 -> 404
+curl -i 'http://localhost:8000/boxes/NO-SUCH-BOX/trajectory-compression?seq_from=0&seq_to=1&max_error=0.1'
+
+# 参数非法（seq_from > seq_to、max_error 为负/非有限值）-> 422
+curl -i 'http://localhost:8000/boxes/BOX-COMP/trajectory-compression?seq_from=5&seq_to=2&max_error=0.1'
+curl -i 'http://localhost:8000/boxes/BOX-COMP/trajectory-compression?seq_from=0&seq_to=4&max_error=-1'
+
+# 区间内事件超过 120 条 -> 422（too_many_events），请缩小序号区间
+curl -i 'http://localhost:8000/boxes/BOX-COMP/trajectory-compression?seq_from=0&seq_to=1000&max_error=0.1'
+```
+
 ## 设计说明
 
 - **去重键**：数据库对 `(box_code, seq)` 建唯一约束（`uq_box_seq`）。
@@ -373,6 +467,9 @@ curl -i 'http://localhost:8000/boxes/BOX-HEAT/heat-exposure?seq_from=0&seq_to=3&
   温度视为线性变化，对超过 `upper_limit` 的部分解析求积（梯形/三角形公式），
   逐段积分用 `math.fsum` 精确求和；校正后间隔为零或超过 `max_gap_seconds` 的段
   直接跳过，缺号不补点。同样不写库，补报后重查即重算。
+- **轨迹压缩只读**：`trajectory-compression` 以序号为横坐标做线性插值重建，
+  把“段中间点全部可省略”建模为有向边，用“最短路径 DP + 字典序贪心”求最少
+  保留点；单次查询限 120 条事件保证求解规模有界。同样不写库，补报后重查即重算。
 - **持久化**：默认 SQLite + WAL，卷挂载于 `/app/data`；
   如需 PostgreSQL/MySQL，只需将 `DATABASE_URL` 换成对应 SQLAlchemy 连接串
   （并安装相应驱动），建表逻辑通用。

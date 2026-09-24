@@ -88,3 +88,25 @@ class HeatExposureResult(BaseModel):
     )
     total_celsius_seconds: float = Field(..., description="各段积分合计（℃·秒）")
     segments: list[HeatExposureSegment] = Field(..., description="计入积分的逐段明细")
+
+
+class TrajectoryCompressionPoint(BaseModel):
+    seq: int = Field(..., description="保留事件的原始序号")
+    event_time: datetime = Field(..., description="保留事件的 UTC 事件时间（不改动原始记录）")
+    temperature: float = Field(..., description="保留事件的温度（℃）")
+
+
+class TrajectoryCompressionResult(BaseModel):
+    box_code: str = Field(..., description="周转箱箱号")
+    seq_from: int = Field(..., description="查询起始序号（含）")
+    seq_to: int = Field(..., description="查询结束序号（含）")
+    max_error: float = Field(..., description="允许的最大重建误差（℃）")
+    event_count: int = Field(..., description="区间内事件条数")
+    kept_count: int = Field(..., description="保留事件条数（首末必留）")
+    omitted_count: int = Field(..., description="被省略事件条数")
+    actual_max_error: float = Field(
+        ..., description="被省略事件的实际最大重建误差（℃），无省略时为 0"
+    )
+    kept_events: list[TrajectoryCompressionPoint] = Field(
+        ..., description="保留事件（按序号升序）；同样保留数下序号序列字典序最小"
+    )

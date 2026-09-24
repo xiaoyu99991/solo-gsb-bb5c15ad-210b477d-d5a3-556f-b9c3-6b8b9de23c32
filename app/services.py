@@ -1,4 +1,4 @@
-"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、时钟回拨校正、超温积分。"""
+"""业务逻辑：事件入库、幂等去重、乱序后的最新状态查询、时钟回拨校正、超温积分、轨迹压缩预览。"""
 import math
 from datetime import datetime, timedelta, timezone
 from fastapi import HTTPException, status
@@ -206,12 +206,13 @@ def _isotonic_blocks(values: list[int]) -> list[tuple[int, int, int]]:
 
 
 def _events_in_range(
-    db: Session, box_code: str, seq_from: int, seq_to: int
+    db: Session, box_code: str, seq_from: int, seq_to: int, limit: int | None = None
 ) -> list[models.BoxEvent] | None:
     """按 seq 升序取区间内事件（含端点）。
 
     箱号不存在（从未上报过）返回 None，由调用方转 404；
     箱号存在但区间内无事件返回 []。缺号不补点，只返回库中实际事件。
+    limit 用于只关心“是否超过 N 条”的场景（取 limit 条即停，避免全量加载）。
     """
     box_exists = db.scalar(
         select(func.count())
@@ -221,17 +222,18 @@ def _events_in_range(
     if not box_exists:
         return None
 
-    return list(
-        db.scalars(
-            select(models.BoxEvent)
-            .where(
-                models.BoxEvent.box_code == box_code,
-                models.BoxEvent.seq >= seq_from,
-                models.BoxEvent.seq <= seq_to,
-            )
-            .order_by(models.BoxEvent.seq)
-        ).all()
+    stmt = (
+        select(models.BoxEvent)
+        .where(
+            models.BoxEvent.box_code == box_code,
+            models.BoxEvent.seq >= seq_from,
+            models.BoxEvent.seq <= seq_to,
+        )
+        .order_by(models.BoxEvent.seq)
     )
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    return list(db.scalars(stmt).all())
 
 
 def _isotonic_suggestions(
@@ -372,4 +374,145 @@ def heat_exposure(
         skipped_segment_count=skipped,
         total_celsius_seconds=math.fsum(exposures),
         segments=segments,
+    )
+
+
+# 单次压缩预览允许的区间内最大事件数；超过即拒绝（422），保证求解规模有界
+MAX_TRAJECTORY_EVENTS = 120
+
+# 浮点重建误差的判定容差：温度量级 ~1e2，float64 插值误差 ~1e-14，
+# 取 1e-9 既吸收浮点噪声（如理论共线点），又不会把真实超限误判为通过
+_INTERP_TOL = 1e-9
+
+
+def _segment_within_error(
+    seqs: list[int], temps: list[float], i: int, j: int, max_error: float
+) -> bool:
+    """段 (i, j) 的中间事件是否都能被线性插值覆盖（重建误差 <= max_error）。
+
+    以序号为横坐标，在 (seqs[i], temps[i]) 与 (seqs[j], temps[j]) 之间线性插值；
+    相邻两点（j = i + 1）没有中间事件，恒可覆盖。
+    """
+    xi, xj = seqs[i], seqs[j]
+    yi, yj = temps[i], temps[j]
+    span = xj - xi
+    for k in range(i + 1, j):
+        interp = yi + (yj - yi) * (seqs[k] - xi) / span
+        if abs(temps[k] - interp) > max_error + _INTERP_TOL:
+            return False
+    return True
+
+
+def _min_kept_indices(
+    seqs: list[int], temps: list[float], max_error: float
+) -> list[int]:
+    """求保留事件的下标子序列：首末必留、数量最少，并列时序号序列字典序最小。
+
+    把“段 (i, j) 的中间点全部可省略”视为有向边 i -> j，则问题等价于
+    0 -> n-1 的最短路径（边数最少 <=> 保留点数最少）。先自右向左 DP 出
+    每个位置到终点的最优保留数，再从左向右贪心选取“可行且仍最优”的
+    最小下标，即得字典序最小解（下标与序号同序）。
+    """
+    n = len(seqs)
+    if n <= 2:  # 单条/两条事件：首末即全部，直接保留
+        return list(range(n))
+
+    # valid[i][j]：段 (i, j) 的中间事件全部在误差内，可整体省略
+    valid = [[False] * n for _ in range(n)]
+    for i in range(n - 1):
+        for j in range(i + 1, n):
+            valid[i][j] = _segment_within_error(seqs, temps, i, j, max_error)
+
+    INF = n + 1
+    best = [INF] * n  # best[i]：从下标 i 到 n-1（含两端）的最少保留数
+    best[n - 1] = 1
+    for i in range(n - 2, -1, -1):
+        for j in range(i + 1, n):
+            if valid[i][j] and best[j] + 1 < best[i]:
+                best[i] = best[j] + 1
+
+    # 相邻事件间恒有边，best[0] 必然有限；逐位取最小可行下标保证字典序最小
+    kept = [0]
+    i = 0
+    while i != n - 1:
+        for j in range(i + 1, n):
+            if valid[i][j] and best[j] == best[i] - 1:
+                kept.append(j)
+                i = j
+                break
+    return kept
+
+
+def trajectory_compression_preview(
+    db: Session, box_code: str, seq_from: int, seq_to: int, max_error: float
+) -> schemas.TrajectoryCompressionResult | None:
+    """区间内温度轨迹的最少点压缩预览（只读即时计算，不写库、不改原始记录）。
+
+    - 以序号为横坐标，在保留点之间按温度线性插值重建被省略事件
+    - 首末事件必留；每个被省略事件的重建温度与原值之差 <= max_error
+    - 保留数最少；并列时保留序号序列字典序最小
+    - 箱号不存在返回 None（路由层转 404）；区间无事件返回空结果
+    - 区间内事件超过 MAX_TRAJECTORY_EVENTS 条：拒绝（422），避免无界计算
+    """
+    events = _events_in_range(
+        db, box_code, seq_from, seq_to, limit=MAX_TRAJECTORY_EVENTS + 1
+    )
+    if events is None:
+        return None
+    if len(events) > MAX_TRAJECTORY_EVENTS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "too_many_events",
+                "message": (
+                    f"区间内事件超过 {MAX_TRAJECTORY_EVENTS} 条，"
+                    "请缩小序号区间后重试"
+                ),
+                "limit": MAX_TRAJECTORY_EVENTS,
+            },
+        )
+    if not events:
+        return schemas.TrajectoryCompressionResult(
+            box_code=box_code,
+            seq_from=seq_from,
+            seq_to=seq_to,
+            max_error=max_error,
+            event_count=0,
+            kept_count=0,
+            omitted_count=0,
+            actual_max_error=0.0,
+            kept_events=[],
+        )
+
+    seqs = [e.seq for e in events]
+    temps = [e.temperature for e in events]
+    kept_idx = _min_kept_indices(seqs, temps, max_error)
+
+    # 实际最大重建误差：被省略事件 |重建值 - 原值| 的最大值（无省略则为 0）
+    actual_max_error = 0.0
+    for a, b in zip(kept_idx, kept_idx[1:]):
+        xa, xb = seqs[a], seqs[b]
+        ya, yb = temps[a], temps[b]
+        span = xb - xa
+        for k in range(a + 1, b):
+            interp = ya + (yb - ya) * (seqs[k] - xa) / span
+            actual_max_error = max(actual_max_error, abs(temps[k] - interp))
+
+    return schemas.TrajectoryCompressionResult(
+        box_code=box_code,
+        seq_from=seq_from,
+        seq_to=seq_to,
+        max_error=max_error,
+        event_count=len(events),
+        kept_count=len(kept_idx),
+        omitted_count=len(events) - len(kept_idx),
+        actual_max_error=actual_max_error,
+        kept_events=[
+            schemas.TrajectoryCompressionPoint(
+                seq=events[i].seq,
+                event_time=events[i].event_time,
+                temperature=events[i].temperature,
+            )
+            for i in kept_idx
+        ],
     )

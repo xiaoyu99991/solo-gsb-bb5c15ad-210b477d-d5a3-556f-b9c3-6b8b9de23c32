@@ -64,6 +64,34 @@ class ClockAuditItem(BaseModel):
     block_seq_to: int = Field(..., description="该事件所属合并块的结束序号")
 
 
+class TrajectoryCompressionPoint(BaseModel):
+    seq: int = Field(..., description="保留事件的原始序号")
+    event_time: datetime = Field(..., description="保留事件的原始 UTC 事件时间")
+    temperature: float = Field(..., description="保留事件的原始温度（℃）")
+
+
+class TrajectoryCompressionResult(BaseModel):
+    box_code: str = Field(..., description="周转箱箱号")
+    seq_from: int = Field(..., description="查询起始序号（含）")
+    seq_to: int = Field(..., description="查询结束序号（含）")
+    max_error: float = Field(..., description="允许的最大重建误差（℃），非负有限")
+    event_count: int = Field(..., description="区间内事件条数")
+    kept_count: int = Field(
+        ..., description="保留事件数（满足误差约束的最少值；同数量时保留序号序列字典序最小）"
+    )
+    omitted_count: int = Field(..., description="被省略事件数（event_count - kept_count）")
+    actual_max_error: float | None = Field(
+        ...,
+        description=(
+            "被省略事件的重建温度与原值之差的最大绝对值（℃）；"
+            "无被省略事件时为 0.0，区间内无事件时为 null"
+        ),
+    )
+    kept_events: list[TrajectoryCompressionPoint] = Field(
+        ..., description="保留事件（按序号升序），原始记录不被改动"
+    )
+
+
 class HeatExposureSegment(BaseModel):
     start_seq: int = Field(..., description="段起点事件序号")
     end_seq: int = Field(..., description="段终点事件序号")

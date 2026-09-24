@@ -180,3 +180,41 @@ def get_box_heat_exposure(
     if result is None:
         raise HTTPException(status_code=404, detail={"error": "box_not_found", "box_code": box_code})
     return result
+
+
+@app.get(
+    "/boxes/{box_code}/trajectory-compression",
+    tags=["boxes"],
+    response_model=schemas.TrajectoryCompressionResult,
+    summary="区间温度轨迹压缩预览（最少保留点，线性插值误差受限，只读不写回）",
+)
+def get_box_trajectory_compression(
+    box_code: str,
+    db: DbSession,
+    seq_from: Annotated[int, Query(ge=0, description="起始序号（含）")],
+    seq_to: Annotated[int, Query(ge=0, description="结束序号（含）")],
+    max_error: Annotated[
+        float,
+        Query(
+            ge=0,
+            allow_inf_nan=False,
+            description="允许的最大重建误差（℃），非负有限值；被省略事件的重建温度与原值之差不得超过它",
+        ),
+    ],
+) -> schemas.TrajectoryCompressionResult:
+    if seq_from > seq_to:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "invalid_range",
+                "message": f"seq_from({seq_from}) 不能大于 seq_to({seq_to})",
+                "seq_from": seq_from,
+                "seq_to": seq_to,
+            },
+        )
+    result = services.trajectory_compression(
+        db, box_code.strip(), seq_from, seq_to, max_error
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail={"error": "box_not_found", "box_code": box_code})
+    return result

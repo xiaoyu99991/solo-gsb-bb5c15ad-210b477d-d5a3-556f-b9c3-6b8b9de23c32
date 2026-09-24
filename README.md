@@ -19,7 +19,7 @@
 │   ├── database.py        # 引擎/会话，启动建表
 │   ├── models.py          # BoxEvent 模型，(box_code, seq) 唯一约束
 │   ├── schemas.py         # 请求/响应模型与时间归一化
-│   ├── services.py        # 幂等去重、冲突判定、最新状态查询、保序回归时钟校正、超温积分
+│   ├── services.py        # 幂等去重、冲突判定、最新状态查询、保序回归时钟校正、超温积分、轨迹压缩预览
 │   └── main.py            # FastAPI 路由
 ├── Dockerfile
 ├── docker-compose.yml
@@ -95,6 +95,7 @@ APP_PORT=9000 docker compose up -d --build
 | GET  | `/boxes/{box_code}/events`    | 单个箱子的全部事件（按序号升序）       |
 | GET  | `/boxes/{box_code}/clock-audit` | 区间事件的设备时钟回拨校正建议（保序回归，不改原始记录） |
 | GET  | `/boxes/{box_code}/heat-exposure` | 区间事件的超温积分（℃·秒，线性插值 + 保序校正时间，不改原始记录） |
+| GET  | `/boxes/{box_code}/trajectory-compression` | 区间温度轨迹压缩预览（最少保留点 + 线性插值误差受限，只读不写回） |
 
 ### 上报事件
 
@@ -355,6 +356,105 @@ curl -i 'http://localhost:8000/boxes/BOX-HEAT/heat-exposure?seq_from=5&seq_to=2&
 curl -i 'http://localhost:8000/boxes/BOX-HEAT/heat-exposure?seq_from=0&seq_to=3&upper_limit=-2&max_gap_seconds=0'
 ```
 
+## 温度轨迹压缩预览（trajectory-compression）
+
+`GET /boxes/{box_code}/trajectory-compression`（默认访问端口 **8000**，
+如 `http://localhost:8000/boxes/BOX-CMP/trajectory-compression`）对指定序号区间内的
+温度轨迹做**有损压缩预览**：以**序号为横坐标**，在保留点之间按温度**线性插值**
+重建被省略的事件，**预览结果只在查询时即时计算，不写回任何原始记录**。
+
+- 按 `seq` 升序取闭区间 `[seq_from, seq_to]` 内事件（缺号不补点，只读库中实际事件），
+  **单次至多 120 条**，区间内超过 120 条返回 `422`。
+- 给定非负且有限的允许最大重建误差 `max_error`（℃），寻找**保留事件数最少**的子序列：
+  **首末事件必须保留**；每个被省略事件的重建温度与其原值之差不得超过 `max_error`。
+- 保留数量相同时，选择**保留序号序列字典序最小**的方案
+  （即更早的事件优先被保留；用 DAG 最短路 DP 精确求解，而非简单贪心跳最远）。
+- 区间内**只有一条事件时直接保留**；箱号存在但**区间内无事件返回空结果**
+  （`kept_events=[]`、`actual_max_error=null`）；箱号不存在返回 `404`。
+
+查询参数：
+
+- `seq_from` / `seq_to`：序号区间，**均为整数且含端点**，必须 `>= 0` 且 `seq_from <= seq_to`。
+- `max_error`：允许的最大重建误差（℃），**非负、有限**数值（传负数、`NaN`、`Infinity` 均为 `422`）。
+
+返回字段：
+
+| 字段                | 说明                                                          |
+| ------------------- | ------------------------------------------------------------- |
+| `event_count`       | 区间内事件条数                                                |
+| `kept_count`        | 保留事件数（满足误差约束的最少值，同数量取字典序最小方案）    |
+| `omitted_count`     | 被省略事件数（`event_count - kept_count`）                    |
+| `actual_max_error`  | 被省略事件重建温度与原值之差的最大绝对值（℃）；无省略点为 `0.0`，区间无事件为 `null` |
+| `kept_events[]`     | 保留事件的原始 `seq` / `event_time` / `temperature`（按序号升序） |
+
+```bash
+# 先上报 8 条事件（UTC，每分钟一条）：前 5 条在 -5℃ 附近小幅波动，随后升温
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-CMP","seq":0,"temperature":-5.0,"event_time":"2026-09-23T02:00:00+00:00"}'
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-CMP","seq":1,"temperature":-4.8,"event_time":"2026-09-23T02:01:00+00:00"}'
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-CMP","seq":2,"temperature":-5.2,"event_time":"2026-09-23T02:02:00+00:00"}'
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-CMP","seq":3,"temperature":-4.9,"event_time":"2026-09-23T02:03:00+00:00"}'
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-CMP","seq":4,"temperature":-5.0,"event_time":"2026-09-23T02:04:00+00:00"}'
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-CMP","seq":5,"temperature":-3.0,"event_time":"2026-09-23T02:05:00+00:00"}'
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-CMP","seq":6,"temperature":-2.6,"event_time":"2026-09-23T02:06:00+00:00"}'
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-CMP","seq":7,"temperature":-2.0,"event_time":"2026-09-23T02:07:00+00:00"}'
+
+# 以 0.3℃ 的最大重建误差预览 0..7 的压缩结果
+curl 'http://localhost:8000/boxes/BOX-CMP/trajectory-compression?seq_from=0&seq_to=7&max_error=0.3'
+```
+
+响应（seq 1/2/3 由弦 (0,4) 重建，最大偏差 0.2℃；seq 6 由弦 (5,7) 重建，偏差 0.1℃；
+seq 5 温度跳变必须保留，共省略 4 条）：
+
+```json
+{
+  "box_code": "BOX-CMP",
+  "seq_from": 0,
+  "seq_to": 7,
+  "max_error": 0.3,
+  "event_count": 8,
+  "kept_count": 4,
+  "omitted_count": 4,
+  "actual_max_error": 0.20000000000000018,
+  "kept_events": [
+    {"seq": 0, "event_time": "2026-09-23T02:00:00", "temperature": -5.0},
+    {"seq": 4, "event_time": "2026-09-23T02:04:00", "temperature": -5.0},
+    {"seq": 5, "event_time": "2026-09-23T02:05:00", "temperature": -3.0},
+    {"seq": 7, "event_time": "2026-09-23T02:07:00", "temperature": -2.0}
+  ]
+}
+```
+
+同数量方案的字典序 tie-break 示例（温度 `-5,-4,-4,-5`，`max_error=0.5`）：
+保留 `{0,1,3}`（省略 seq=2，弦 (1,3) 在 seq=2 重建为 -4.5，误差恰为 0.5）
+与保留 `{0,2,3}`（省略 seq=1，误差同样为 0.5）都是 3 个保留点的可行最优方案，
+按序号序列字典序最小选择前者：
+
+```bash
+# 仅一条事件 -> 直接保留，actual_max_error=0.0
+curl 'http://localhost:8000/boxes/BOX-CMP/trajectory-compression?seq_from=2&seq_to=2&max_error=0.3'
+
+# 箱号存在但区间内无事件 -> 200，空结果（actual_max_error=null）
+curl 'http://localhost:8000/boxes/BOX-CMP/trajectory-compression?seq_from=100&seq_to=200&max_error=0.3'
+
+# 箱号不存在 -> 404
+curl -i 'http://localhost:8000/boxes/NO-SUCH-BOX/trajectory-compression?seq_from=0&seq_to=1&max_error=0.3'
+
+# 区间内超过 120 条 -> 422
+curl -i 'http://localhost:8000/boxes/BOX-CMP/trajectory-compression?seq_from=0&seq_to=1000&max_error=0.3'
+
+# 参数非法（seq_from > seq_to、负误差、NaN/Infinity 等）-> 422
+curl -i 'http://localhost:8000/boxes/BOX-CMP/trajectory-compression?seq_from=5&seq_to=2&max_error=0.3'
+curl -i 'http://localhost:8000/boxes/BOX-CMP/trajectory-compression?seq_from=0&seq_to=3&max_error=-0.1'
+```
+
 ## 设计说明
 
 - **去重键**：数据库对 `(box_code, seq)` 建唯一约束（`uq_box_seq`）。
@@ -373,6 +473,13 @@ curl -i 'http://localhost:8000/boxes/BOX-HEAT/heat-exposure?seq_from=0&seq_to=3&
   温度视为线性变化，对超过 `upper_limit` 的部分解析求积（梯形/三角形公式），
   逐段积分用 `math.fsum` 精确求和；校正后间隔为零或超过 `max_gap_seconds` 的段
   直接跳过，缺号不补点。同样不写库，补报后重查即重算。
+- **轨迹压缩只读**：`trajectory-compression` 复用区间事件查询（按 `seq` 升序、
+  缺号不补点），以序号为横坐标做最少保留点压缩。段 `(i,j)` 可行仅取决于两端点，
+  因此问题等价于在“可行段”构成的 DAG 上求 0→n-1 的最短路径：用 DP 精确求解
+  保留数最少、同数量时保留序号字典序最小的方案（贪心跳最远无法保证字典序最小）。
+  误差比较用 `Fraction` 精确计算（float 温度与整数序号均可无损转为有理数），
+  避免浮点误差在 `max_error` 边界上误判；单次限 120 条，O(n³) 开销可控。
+  预览不写库，乱序补报后重查即自动重算。
 - **持久化**：默认 SQLite + WAL，卷挂载于 `/app/data`；
   如需 PostgreSQL/MySQL，只需将 `DATABASE_URL` 换成对应 SQLAlchemy 连接串
   （并安装相应驱动），建表逻辑通用。
